@@ -1,5 +1,5 @@
 import streamlit as st
-import openai
+import google.generativeai as genai
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import json
@@ -8,13 +8,14 @@ import os
 # --- Configuration ---
 # Load secrets from Streamlit's secrets management
 try:
-    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+    # Switched from OpenAI to Google Gemini
+    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
     SPOTIFY_CLIENT_ID = st.secrets["SPOTIFY_CLIENT_ID"]
     SPOTIFY_CLIENT_SECRET = st.secrets["SPOTIFY_CLIENT_SECRET"]
-    # For local development, you might use environment variables instead.
-    # This part is for Streamlit Cloud deployment.
-    # The REDIRECT_URI should be the URL of your deployed Streamlit app.
-    # For local testing, it's often http://localhost:8501
+    
+    # This is the Redirect URI for your deployed app. 
+    # For local testing, you must change this to "http://localhost:8501" 
+    # AND update it in your Spotify Developer Dashboard.
     REDIRECT_URI = "https://vibelist-ai.streamlit.app/"
 except FileNotFoundError:
     st.error("Secrets file not found. Make sure you have a .streamlit/secrets.toml file with your API keys.")
@@ -26,11 +27,11 @@ except KeyError as e:
 # Spotify authentication scope
 SCOPE = "playlist-modify-private playlist-modify-public"
 
-# Initialize OpenAI client
+# Initialize Google AI client
 try:
-    openai.api_key = OPENAI_API_KEY
-except openai.error.AuthenticationError:
-    st.error("OpenAI API key is invalid. Please check your secrets.")
+    genai.configure(api_key=GOOGLE_API_KEY)
+except Exception as e:
+    st.error(f"Failed to configure Google AI client. Please check your API key. Error: {e}")
     st.stop()
 
 # --- Helper Functions ---
@@ -47,9 +48,10 @@ def get_spotify_auth_manager():
 
 def generate_song_list(vibe):
     """
-    Uses OpenAI's GPT model to generate a list of songs based on a vibe.
-    Returns a list of dictionaries, e.g., [{'artist': 'Artist Name', 'track': 'Track Name'}].
+    Uses Google's Gemini model to generate a list of songs based on a vibe.
     """
+    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+
     prompt = f"""
     You are a world-class DJ and music curator, a master of crafting the perfect playlist for any mood or vibe.
     A user has described the following vibe: "{vibe}".
@@ -67,25 +69,23 @@ def generate_song_list(vibe):
       ]
     }}
 
-    Do not include any introductory text, explanations, or markdown formatting around the JSON object.
+    Do not include any introductory text, explanations, or markdown formatting like ```json around the JSON object.
     Only output the raw JSON.
     """
     
     try:
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a helpful music assistant that provides JSON responses."},
-                {"role": "user", "content": prompt}
-            ],
-            response_format={"type": "json_object"}
+        # Gemini has a specific generation config for forcing JSON output
+        generation_config = genai.types.GenerationConfig(
+            response_mime_type="application/json"
         )
-        # The response content is a JSON string, so we need to parse it.
-        result_text = response.choices[0].message.content
-        song_data = json.loads(result_text)
+        response = model.generate_content(prompt, generation_config=generation_config)
+        
+        # The response text should be a clean JSON string
+        song_data = json.loads(response.text)
         return song_data.get("songs", [])
-    except json.JSONDecodeError:
-        st.error("The AI returned an invalid format. Please try again.")
+    except json.JSONDecodeError as e:
+        st.error(f"The AI returned an invalid format. It might be helpful to try a different vibe. Details: {e}")
+        st.error(f"AI Raw Response: {response.text}") # Show what the AI sent back
         return None
     except Exception as e:
         st.error(f"An error occurred while communicating with the AI: {e}")
@@ -245,3 +245,4 @@ else:
         del st.session_state['token_info']
         st.success("You have been logged out.")
         st.rerun()
+

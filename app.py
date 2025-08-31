@@ -15,7 +15,7 @@ try:
     # This part is for Streamlit Cloud deployment.
     # The REDIRECT_URI should be the URL of your deployed Streamlit app.
     # For local testing, it's often http://localhost:8501
-    REDIRECT_URI = "http://192.168.0.106:8501/"
+    REDIRECT_URI = "https://vibelist-ai.streamlit.app/"
 except FileNotFoundError:
     st.error("Secrets file not found. Make sure you have a .streamlit/secrets.toml file with your API keys.")
     st.stop()

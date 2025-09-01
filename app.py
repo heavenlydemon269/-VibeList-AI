@@ -42,17 +42,28 @@ def get_spotify_auth_manager():
         redirect_uri=REDIRECT_URI, scope=SCOPE, cache_path=".spotify_cache"
     )
 
-def recommend_songs_from_vibe(vibe, num_recommendations=15):
+def recommend_songs_from_vibe(vibe, num_recommendations=15, exclude_track_ids=None):
     """
-    Uses the custom sentence transformer model and FAISS index to find songs.
+    Uses the custom sentence transformer model and FAISS index to find songs,
+    excluding any IDs that are already in the playlist.
     """
     if model is None or faiss_index is None:
         return pd.DataFrame()
 
+    if exclude_track_ids is None:
+        exclude_track_ids = []
+
+    # Fetch more candidates than needed to account for filtering
+    num_candidates = num_recommendations + len(exclude_track_ids) + 30 
+    
     vibe_embedding = model.encode([vibe])
-    D, I = faiss_index.search(vibe_embedding, num_recommendations)
-    recommended_songs_df = song_df.iloc[I[0]]
-    return recommended_songs_df
+    D, I = faiss_index.search(vibe_embedding, num_candidates)
+    
+    # Filter out already present songs
+    candidate_songs_df = song_df.iloc[I[0]]
+    recommended_songs_df = candidate_songs_df[~candidate_songs_df['id'].isin(exclude_track_ids)]
+    
+    return recommended_songs_df.head(num_recommendations)
 
 def create_spotify_playlist(vibe, recommended_songs_df, sp_client):
     """Creates a new playlist and returns the full playlist object."""
@@ -88,6 +99,42 @@ def add_tracks_to_playlist(playlist_id, new_songs_df, sp_client):
     except Exception as e:
         st.error(f"Failed to add tracks to playlist: {e}")
         return False
+
+def remove_tracks_from_playlist(playlist_id, track_ids_to_remove, sp_client):
+    """Removes a list of tracks from a specified playlist."""
+    if not track_ids_to_remove:
+        return False
+    try:
+        tracks = [{"uri": f"spotify:track:{track_id}"} for track_id in track_ids_to_remove]
+        sp_client.playlist_remove_specific_occurrences_of_items(playlist_id, tracks)
+        return True
+    except Exception as e:
+        st.error(f"Failed to remove tracks: {e}")
+        return False
+
+def get_playlist_tracks(playlist_id, sp_client):
+    """Fetches all tracks currently in a given playlist."""
+    try:
+        results = sp_client.playlist_items(playlist_id)
+        tracks = []
+        while results:
+            for item in results.get('items', []):
+                track = item.get('track')
+                if track and track.get('id'):
+                    tracks.append({
+                        'id': track['id'],
+                        'name': track['name'],
+                        'artist': track['artists'][0]['name']
+                    })
+            # Check for pagination
+            if results['next']:
+                results = sp.next(results)
+            else:
+                results = None
+        return pd.DataFrame(tracks)
+    except Exception as e:
+        st.error(f"Could not fetch playlist tracks: {e}")
+        return pd.DataFrame()
 
 # --- Streamlit UI ---
 
@@ -189,17 +236,45 @@ else:
                     st.error("The model couldn't find any songs for that vibe. Try being more descriptive.")
     else:
         # STATE 2: REFINE AN EXISTING PLAYLIST
-        st.header("🎉 Your playlist is ready!")
-        st.markdown(f"**[Click here to open it in Spotify]({st.session_state['playlist_url']})**")
-        st.balloons()
-        
+        st.header("🎉 Your Playlist")
+        st.markdown(f"**[Open on Spotify]({st.session_state['playlist_url']})**")
+
+        # Display current tracks and add remove functionality
+        st.subheader("Current Tracks")
+        with st.spinner("Loading current playlist..."):
+            current_tracks_df = get_playlist_tracks(st.session_state['playlist_id'], sp_client)
+
+        if not current_tracks_df.empty:
+            st.session_state['current_track_ids'] = current_tracks_df['id'].tolist()
+            for index, row in current_tracks_df.iterrows():
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    st.write(f"**{row['name']}** by {row['artist']}")
+                with col2:
+                    if st.button("Remove", key=f"remove_{row['id']}", use_container_width=True):
+                        with st.spinner("Removing song..."):
+                            success = remove_tracks_from_playlist(st.session_state['playlist_id'], [row['id']], sp_client)
+                        if success:
+                            st.toast(f"Removed '{row['name']}'!")
+                            if hasattr(st, 'rerun'):
+                                st.rerun()
+                            else:
+                                st.experimental_rerun()
+                        else:
+                            st.error("Failed to remove the song.")
+        else:
+            st.warning("Your playlist is currently empty.")
+            st.session_state['current_track_ids'] = []
+
+        st.markdown("---")
         st.header("2. Refine Your Playlist")
-        st.info(f"Current vibe: **{st.session_state['original_vibe']}**")
+        st.info(f"Original vibe: **{st.session_state['original_vibe']}**")
 
         refinement_input = st.text_input(
-            "Add more songs with this vibe:",
+            "What should we add?",
             placeholder="e.g., more rock music, something upbeat"
         )
+        num_songs_to_add = st.slider("How many songs to add?", min_value=1, max_value=25, value=10)
 
         if st.button("➕ Add More Songs", use_container_width=True):
             if not refinement_input:
@@ -207,10 +282,14 @@ else:
             else:
                 new_vibe = f"{st.session_state['original_vibe']}, {refinement_input}"
                 with st.spinner(f"Finding new songs for refined vibe..."):
-                    new_songs = recommend_songs_from_vibe(new_vibe)
+                    new_songs = recommend_songs_from_vibe(
+                        new_vibe,
+                        num_recommendations=num_songs_to_add,
+                        exclude_track_ids=st.session_state.get('current_track_ids', [])
+                    )
                 
                 if not new_songs.empty:
-                    with st.expander("Songs to be added"):
+                    with st.expander("Songs to be added", expanded=True):
                         display_df = new_songs[['name', 'artist_name']].copy()
                         display_df.rename(columns={'artist_name': 'Artist'}, inplace=True)
                         st.dataframe(display_df)
@@ -220,11 +299,15 @@ else:
                     
                     if success:
                         st.toast("✅ Songs added successfully!")
+                        if hasattr(st, 'rerun'):
+                            st.rerun()
+                        else:
+                            st.experimental_rerun()
                 else:
                     st.error("Couldn't find any new songs for that refinement.")
         
         if st.button("Start Over"):
-            keys_to_clear = ['playlist_id', 'playlist_url', 'original_vibe']
+            keys_to_clear = ['playlist_id', 'playlist_url', 'original_vibe', 'current_track_ids']
             for key in keys_to_clear:
                 if key in st.session_state:
                     del st.session_state[key]
@@ -236,7 +319,7 @@ else:
     # --- LOGOUT BUTTON (always visible when logged in) ---
     st.markdown("---")
     if st.button("Logout of Spotify"):
-        keys_to_clear = ['token_info', 'playlist_id', 'playlist_url', 'original_vibe']
+        keys_to_clear = ['token_info', 'playlist_id', 'playlist_url', 'original_vibe', 'current_track_ids']
         for key in keys_to_clear:
             if key in st.session_state:
                 del st.session_state[key]

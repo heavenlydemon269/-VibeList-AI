@@ -1,2 +1,6 @@
-google-generativeai
 spotipy
+pandas
+sentence-transformers
+faiss-cpu
+numpy
+tqdm

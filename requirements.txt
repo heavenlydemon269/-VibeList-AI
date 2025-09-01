@@ -1,4 +1,5 @@
 spotipy
+google-generativeai
 pandas
 sentence-transformers
 faiss-cpu

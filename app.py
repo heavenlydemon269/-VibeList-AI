@@ -100,13 +100,34 @@ if model is None:
 
 # --- Authentication Flow ---
 auth_manager = get_spotify_auth_manager()
-query_params = st.query_params
+
+# Use st.experimental_get_query_params() for older versions, st.query_params for newer
+if hasattr(st, 'query_params'):
+    query_params = st.query_params
+else:
+    query_params = st.experimental_get_query_params()
+
 if "code" in query_params:
     try:
-        token_info = auth_manager.get_access_token(query_params["code"])
+        # For dictionary-like query_params (newer Streamlit)
+        if isinstance(query_params, dict):
+            code = query_params.get("code")
+        else: # For list-like query_params (older Streamlit)
+            code = query_params["code"][0]
+
+        token_info = auth_manager.get_access_token(code)
         st.session_state['token_info'] = token_info
-        st.query_params.clear()
-        st.rerun()
+        
+        # Clear query params
+        if hasattr(st, 'query_params'):
+            st.query_params.clear()
+        
+        # Use st.rerun() if available, otherwise fallback for older versions
+        if hasattr(st, 'rerun'):
+            st.rerun()
+        else:
+            st.experimental_rerun()
+            
     except Exception as e:
         st.error(f"Error getting access token: {e}")
 
@@ -124,7 +145,10 @@ else:
         except Exception:
             st.error("Your session has expired. Please log in again.")
             del st.session_state['token_info']
-            st.rerun()
+            if hasattr(st, 'rerun'):
+                st.rerun()
+            else:
+                st.experimental_rerun()
 
     try:
         sp_client = spotipy.Spotify(auth=st.session_state['token_info']['access_token'])
@@ -133,7 +157,10 @@ else:
     except Exception as e:
         st.error(f"Error connecting to Spotify. Details: {e}")
         del st.session_state['token_info']
-        st.rerun()
+        if hasattr(st, 'rerun'):
+            st.rerun()
+        else:
+            st.experimental_rerun()
 
     # --- Main App Interface ---
     st.markdown("---")
@@ -155,7 +182,10 @@ else:
                 st.info(f"Model recommended {len(recommended_songs)} songs.")
                 
                 with st.expander("See Recommended Songs"):
-                    st.dataframe(recommended_songs[['name', 'artist']])
+                    # **FIX**: Use 'artist_name' which exists in the dataframe, and rename it for display
+                    display_df = recommended_songs[['name', 'artist_name']].copy()
+                    display_df.rename(columns={'artist_name': 'Artist'}, inplace=True)
+                    st.dataframe(display_df)
                     
                 with st.spinner("🎶 Creating your new playlist on Spotify..."):
                     playlist_url = create_spotify_playlist(vibe_input, recommended_songs, sp_client)
@@ -171,5 +201,8 @@ else:
     if st.button("Logout of Spotify"):
         del st.session_state['token_info']
         st.success("You have been logged out.")
-        st.rerun()
+        if hasattr(st, 'rerun'):
+            st.rerun()
+        else:
+            st.experimental_rerun()
 

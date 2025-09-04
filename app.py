@@ -37,7 +37,7 @@ except Exception as e:
 # --- Helper Functions ---
 
 
-def sanitize_for_spotify(input_string):
+def sanitize_vibe(input_string):
     """
     Cleans a string to make it safe for Spotify API fields like name and description.
     - Removes leading/trailing whitespace.
@@ -50,6 +50,7 @@ def sanitize_for_spotify(input_string):
     # Remove leading/trailing whitespace that might have been left
     s = s.strip()
     return s
+    
 def get_spotify_auth_manager():
     """Creates and returns a SpotifyOAuth object for handling authentication."""
     return SpotifyOAuth(

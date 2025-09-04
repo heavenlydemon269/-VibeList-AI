@@ -3,8 +3,9 @@ import google.generativeai as genai
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import json
-import os
 import re
+import pandas as pd # Added for data handling
+
 # --- Configuration ---
 # Load secrets from Streamlit's secrets management
 try:
@@ -36,9 +37,26 @@ except Exception as e:
 
 # --- Helper Functions ---
 
-
-
-    
+@st.cache_data # Use Streamlit's cache to load the data only once
+def load_song_dataset(dataset_path="spotify_dataset.csv"):
+    """Loads the song dataset from a CSV file into a pandas DataFrame."""
+    try:
+        df = pd.read_csv(dataset_path)
+        # --- IMPORTANT ---
+        # Ensure your CSV column names are 'track' and 'artist'.
+        # If they are different (e.g., 'track_name', 'artist_name'), rename them below:
+        # df = df.rename(columns={'track_name': 'track', 'artist_name': 'artist'})
+        if 'track' not in df.columns or 'artist' not in df.columns:
+            st.error("Dataset must contain 'track' and 'artist' columns.")
+            return None
+        return df
+    except FileNotFoundError:
+        st.error(f"Dataset file '{dataset_path}' not found. Please make sure it's in the same directory as the script.")
+        return None
+    except Exception as e:
+        st.error(f"Error loading dataset: {e}")
+        return None
+        
 def get_spotify_auth_manager():
     """Creates and returns a SpotifyOAuth object for handling authentication."""
     return SpotifyOAuth(
@@ -49,40 +67,91 @@ def get_spotify_auth_manager():
         cache_path=".spotify_cache" # Caches the token
     )
 
-def generate_song_list(vibe):
+def find_candidate_songs(vibe, dataframe, num_candidates=200):
     """
-    Uses Google's Gemini model to generate a list of songs based on a vibe.
+    Searches the dataframe for songs that match keywords from the vibe.
+    Returns a formatted string of candidate songs for the LLM prompt.
+    """
+    if dataframe is None:
+        return ""
+
+    # A simple keyword matching strategy.
+    keywords = set(re.split(r'\s+', vibe.lower()))
+    
+    # Search for keywords in track and artist names
+    # This finds rows where ANY keyword is present in the track or artist name
+    mask = dataframe['track'].str.contains('|'.join(keywords), case=False, na=False) | \
+           dataframe['artist'].str.contains('|'.join(keywords), case=False, na=False)
+
+    candidate_df = dataframe[mask]
+
+    # If we find too many, take a random sample to keep the prompt size reasonable
+    if len(candidate_df) > num_candidates:
+        candidate_df = candidate_df.sample(n=num_candidates, random_state=1) # a fixed state for reproducibility
+
+    if candidate_df.empty:
+        return "" # No candidates found
+
+    # Format the candidates into a simple string for the prompt
+    song_list = []
+    for _, row in candidate_df.iterrows():
+        # Clean the data to prevent breaking the JSON format in the prompt
+        artist_clean = str(row['artist']).replace('"', "'")
+        track_clean = str(row['track']).replace('"', "'")
+        song_list.append(f"{{ \"artist\": \"{artist_clean}\", \"track\": \"{track_clean}\" }}")
+    
+    return ",\n".join(song_list)
+
+
+def generate_song_list(vibe, song_dataset):
+    """
+    Uses Google's Gemini model to generate a list of songs based on a vibe,
+    constrained by a list of candidate songs from our dataset.
     """
     model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
+    # 1. Retrieve candidate songs from our dataset based on the vibe
+    candidate_songs_str = find_candidate_songs(vibe, song_dataset)
+
+    if not candidate_songs_str:
+        st.warning("Could not find relevant songs in the local dataset for that vibe. The AI will generate from its own knowledge, which may be less accurate.")
+        # We can create a fallback prompt, but for now, we'll let the main prompt handle it.
+        # An empty candidate list will force the model to rely on its own knowledge, but the prompt will still ask it to choose from the (empty) list.
+        # Let's adjust the prompt slightly to handle this.
+    
+    # 2. Augment the prompt with the candidates
     prompt = f"""
-    You are a world-class DJ and music curator, a master of crafting the perfect playlist for any mood or vibe.
+    You are a world-class DJ and music curator.
     A user has described the following vibe: "{vibe}".
 
-    Based on this vibe, generate a list of 15 songs that perfectly capture this feeling.
-    Your response MUST be a valid JSON object. The object should have a single key "songs", 
-    which is an array of objects. Each object in the array must have two keys: "artist" and "track".
+    I have a specific list of songs available. Your task is to select exactly 15 songs from the provided list below that BEST match the user's vibe.
+    You MUST ONLY choose from the candidate songs provided. Do not invent any songs or artists.
+
+    Here is the list of available candidate songs in a JSON-like format:
+    [
+    {candidate_songs_str}
+    ]
+
+    Your response MUST be a valid JSON object. The object should have a single key "songs",
+    which is an array of objects. Each object in the array must be one of the songs from the list I provided and must have two keys: "artist" and "track".
 
     Example of the required JSON format:
     {{
       "songs": [
         {{ "artist": "A. R. Rahman", "track": "Chaiyya Chaiyya" }},
-        {{ "artist": "Prateek Kuhad", "track": "cold/mess" }},
-        {{ "artist": "Lana Del Rey", "track": "Summertime Sadness" }}
+        {{ "artist": "Prateek Kuhad", "track": "cold/mess" }}
       ]
     }}
 
     Do not include any introductory text, explanations, or markdown formatting like ```json around the JSON object.
     Only output the raw JSON."""
-    
+
     try:
-        # Gemini has a specific generation config for forcing JSON output
         generation_config = genai.types.GenerationConfig(
             response_mime_type="application/json"
         )
         response = model.generate_content(prompt, generation_config=generation_config)
         
-        # The response text should be a clean JSON string
         song_data = json.loads(response.text)
         return song_data.get("songs", [])
     except json.JSONDecodeError as e:
@@ -126,14 +195,10 @@ def find_spotify_tracks(songs, sp_client):
 def sanitize_for_spotify(input_string):
     """
     Cleans a string to make it safe for Spotify API fields like name and description.
-    - Removes leading/trailing whitespace.
-    - Replaces multiple whitespace characters (including newlines) with a single space.
     """
     if not input_string:
         return ""
-    # Replace any sequence of whitespace characters (spaces, tabs, newlines) with a single space
     s = re.sub(r'\s+', ' ', input_string)
-    # Remove leading/trailing whitespace that might have been left
     s = s.strip()
     return s
 
@@ -153,7 +218,7 @@ def create_spotify_playlist(vibe, track_uris, sp_client):
             description=description_text
         )
         
-        # Spotify API can only add 100 tracks at a time, so we chunk it just in case
+        # Spotify API can only add 100 tracks at a time
         chunk_size = 100
         for i in range(0, len(track_uris), chunk_size):
             chunk = track_uris[i:i+chunk_size]
@@ -166,7 +231,7 @@ def create_spotify_playlist(vibe, track_uris, sp_client):
 
 # --- Streamlit UI ---
 
-st.set_page_config(page_title="VibeList AI", page_icon="./Logo.png")
+st.set_page_config(page_title="VibeList AI", page_icon="🎵")
 st.title("🎵 VibeList AI")
 st.subheader("Your personal AI DJ for creating the perfect Spotify playlist from any vibe.")
 
@@ -191,7 +256,6 @@ if "code" in query_params:
 if 'token_info' not in st.session_state:
     auth_url = auth_manager.get_authorize_url()
     st.info("To get started, you need to connect your Spotify account.")
-    # Using st.link_button for a clean redirect
     st.link_button("Login with Spotify", auth_url)
 else:
     # User is authenticated
@@ -218,6 +282,8 @@ else:
         del st.session_state['token_info']
         st.rerun()
 
+    # --- Load your local song dataset ---
+    song_dataset_df = load_song_dataset()
 
     # --- Main App Interface ---
     st.markdown("---")
@@ -231,9 +297,12 @@ else:
     if st.button("✨ Generate Playlist ✨", type="primary", use_container_width=True):
         if not vibe_input:
             st.warning("Please describe a vibe first!")
+        elif song_dataset_df is None:
+            st.error("Cannot generate playlist because the song dataset failed to load. Check the file path and format.")
         else:
             with st.spinner("🎧 Asking the AI DJ for recommendations... (This might take a moment)"):
-                songs = generate_song_list(vibe_input)
+                # Pass the loaded dataframe to the generation function
+                songs = generate_song_list(vibe_input, song_dataset_df)
 
             if songs:
                 st.info(f"AI recommended {len(songs)} songs. Now finding them on Spotify...")

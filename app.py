@@ -4,7 +4,6 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import json
 import re
-import pandas as pd # Added for data handling
 
 # --- Configuration ---
 # Load secrets from Streamlit's secrets management
@@ -37,26 +36,6 @@ except Exception as e:
 
 # --- Helper Functions ---
 
-@st.cache_data # Use Streamlit's cache to load the data only once
-def load_song_dataset(dataset_path="spotify_dataset.csv"):
-    """Loads the song dataset from a CSV file into a pandas DataFrame."""
-    try:
-        df = pd.read_csv(dataset_path)
-        # --- IMPORTANT ---
-        # Ensure your CSV column names are 'track' and 'artist'.
-        # If they are different (e.g., 'track_name', 'artist_name'), rename them below:
-        # df = df.rename(columns={'track_name': 'track', 'artist_name': 'artist'})
-        if 'track' not in df.columns or 'artist' not in df.columns:
-            st.error("Dataset must contain 'track' and 'artist' columns.")
-            return None
-        return df
-    except FileNotFoundError:
-        st.error(f"Dataset file '{dataset_path}' not found. Please make sure it's in the same directory as the script.")
-        return None
-    except Exception as e:
-        st.error(f"Error loading dataset: {e}")
-        return None
-        
 def get_spotify_auth_manager():
     """Creates and returns a SpotifyOAuth object for handling authentication."""
     return SpotifyOAuth(
@@ -67,131 +46,164 @@ def get_spotify_auth_manager():
         cache_path=".spotify_cache" # Caches the token
     )
 
-def find_candidate_songs(vibe, dataframe, num_candidates=200):
-    """
-    Searches the dataframe for songs that match keywords from the vibe.
-    Returns a formatted string of candidate songs for the LLM prompt.
-    """
-    if dataframe is None:
-        return ""
-
-    # A simple keyword matching strategy.
-    keywords = set(re.split(r'\s+', vibe.lower()))
-    
-    # Search for keywords in track and artist names
-    # This finds rows where ANY keyword is present in the track or artist name
-    mask = dataframe['track'].str.contains('|'.join(keywords), case=False, na=False) | \
-           dataframe['artist'].str.contains('|'.join(keywords), case=False, na=False)
-
-    candidate_df = dataframe[mask]
-
-    # If we find too many, take a random sample to keep the prompt size reasonable
-    if len(candidate_df) > num_candidates:
-        candidate_df = candidate_df.sample(n=num_candidates, random_state=1) # a fixed state for reproducibility
-
-    if candidate_df.empty:
-        return "" # No candidates found
-
-    # Format the candidates into a simple string for the prompt
-    song_list = []
-    for _, row in candidate_df.iterrows():
-        # Clean the data to prevent breaking the JSON format in the prompt
-        artist_clean = str(row['artist']).replace('"', "'")
-        track_clean = str(row['track']).replace('"', "'")
-        song_list.append(f"{{ \"artist\": \"{artist_clean}\", \"track\": \"{track_clean}\" }}")
-    
-    return ",\n".join(song_list)
-
-
-def generate_song_list(vibe, song_dataset):
-    """
-    Uses Google's Gemini model to generate a list of songs based on a vibe,
-    constrained by a list of candidate songs from our dataset.
-    """
+def get_next_song_suggestion(vibe, found_songs, rejected_songs):
+    """Asks the LLM for a single new song suggestion based on the current context."""
     model = genai.GenerativeModel('gemini-1.5-flash-latest')
-
-    # 1. Retrieve candidate songs from our dataset based on the vibe
-    candidate_songs_str = find_candidate_songs(vibe, song_dataset)
-
-    if not candidate_songs_str:
-        st.warning("Could not find relevant songs in the local dataset for that vibe. The AI will generate from its own knowledge, which may be less accurate.")
-        # We can create a fallback prompt, but for now, we'll let the main prompt handle it.
-        # An empty candidate list will force the model to rely on its own knowledge, but the prompt will still ask it to choose from the (empty) list.
-        # Let's adjust the prompt slightly to handle this.
-    
-    # 2. Augment the prompt with the candidates
+    found_songs_str = "\n".join([f"- {s['track']} by {s['artist']}" for s in found_songs])
+    rejected_songs_str = ", ".join(rejected_songs)
     prompt = f"""
-    You are a world-class DJ and music curator.
-    A user has described the following vibe: "{vibe}".
+    You are a music curator building a 15-song playlist for the vibe: "{vibe}".
+    
+    Here are the songs you have successfully found so far:
+    {found_songs_str if found_songs else "None yet."}
 
-    I have a specific list of songs available. Your task is to select exactly 15 songs from the provided list below that BEST match the user's vibe.
-    You MUST ONLY choose from the candidate songs provided. Do not invent any songs or artists.
+    Here are the songs you suggested that could NOT be found on Spotify. Do NOT suggest these again:
+    {rejected_songs_str if rejected_songs else "None."}
 
-    Here is the list of available candidate songs in a JSON-like format:
-    [
-    {candidate_songs_str}
-    ]
-
-    Your response MUST be a valid JSON object. The object should have a single key "songs",
-    which is an array of objects. Each object in the array must be one of the songs from the list I provided and must have two keys: "artist" and "track".
-
-    Example of the required JSON format:
-    {{
-      "songs": [
-        {{ "artist": "A. R. Rahman", "track": "Chaiyya Chaiyya" }},
-        {{ "artist": "Prateek Kuhad", "track": "cold/mess" }}
-      ]
-    }}
-
-    Do not include any introductory text, explanations, or markdown formatting like ```json around the JSON object.
-    Only output the raw JSON."""
-
+    Your task is to suggest the NEXT SINGLE SONG to add to the playlist.
+    
+    Your response MUST be a valid JSON object with two keys: "artist" and "track".
+    Example: {{ "artist": "Arijit Singh", "track": "Tera Yaar Hoon Main" }}
+    
+    Only output the raw JSON.
+    """
     try:
-        generation_config = genai.types.GenerationConfig(
-            response_mime_type="application/json"
-        )
+        generation_config = genai.types.GenerationConfig(response_mime_type="application/json")
         response = model.generate_content(prompt, generation_config=generation_config)
-        
-        song_data = json.loads(response.text)
-        return song_data.get("songs", [])
-    except json.JSONDecodeError as e:
-        st.error(f"The AI returned an invalid format. It might be helpful to try a different vibe. Details: {e}")
-        st.error(f"AI Raw Response: {response.text}") # Show what the AI sent back
-        return None
-    except Exception as e:
-        st.error(f"An error occurred while communicating with the AI: {e}")
+        return json.loads(response.text)
+    except Exception:
         return None
 
+def get_clarification_from_llm(original_suggestion, spotify_options):
+    """Asks the LLM to choose from a list of possible matches from Spotify."""
+    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    options_str = "\n".join([f"- {opt['track']} by {opt['artist']}" for opt in spotify_options])
+    
+    prompt = f"""
+    You are a helpful music assistant. I was trying to find your suggestion "{original_suggestion['track']} by {original_suggestion['artist']}" on Spotify, but couldn't find an exact match.
+    
+    However, Spotify provided the following similar tracks:
+    {options_str}
 
-def find_spotify_tracks(songs, sp_client):
-    """
-    Searches for tracks on Spotify and returns a list of their URIs.
-    """
-    track_uris = []
-    not_found_tracks = []
+    Is one of these the correct song you intended to suggest? 
     
-    progress_bar = st.progress(0, text="Searching for tracks on Spotify...")
+    - If YES, respond with the corrected JSON for that song (e.g., {{ "artist": "Correct Artist", "track": "Correct Track" }}).
+    - If NO, respond with JSON: {{ "artist": "None", "track": "None" }}.
     
-    for i, song in enumerate(songs):
-        artist = song.get("artist", "")
-        track = song.get("track", "")
-        query = f"track:{track} artist:{artist}"
+    Only output the raw JSON.
+    """
+    try:
+        generation_config = genai.types.GenerationConfig(response_mime_type="application/json")
+        response = model.generate_content(prompt, generation_config=generation_config)
+        clarified_choice = json.loads(response.text)
+        if clarified_choice.get("track") == "None":
+            return None
+        return clarified_choice
+    except Exception:
+        return None
+
+def verify_song_on_spotify(suggestion, sp_client):
+    """
+    Verifies a song suggestion on Spotify with a 3-tier logic:
+    1. Exact search.
+    2. Broad search for clarification.
+    3. Hard fail.
+    Returns a dictionary with status and data.
+    """
+    track_name = suggestion['track']
+    artist_name = suggestion['artist']
+    
+    # 1. Exact Search
+    query_exact = f"track:\"{track_name}\" artist:\"{artist_name}\""
+    results_exact = sp_client.search(q=query_exact, type='track', limit=1)
+    if results_exact['tracks']['items']:
+        return {'status': 'FOUND', 'data': results_exact['tracks']['items'][0]}
+
+    # 2. Broaden Search if Exact Fails
+    query_broad = f"track:\"{track_name}\""
+    results_broad = sp_client.search(q=query_broad, type='track', limit=5)
+    if results_broad['tracks']['items']:
+        options = [
+            {'track': item['name'], 'artist': item['artists'][0]['name']} 
+            for item in results_broad['tracks']['items']
+        ]
+        # Return options for the LLM to clarify
+        return {'status': 'NEEDS_CLARIFICATION', 'data': options}
         
-        try:
-            results = sp_client.search(q=query, type='track', limit=1)
-            tracks = results['tracks']['items']
-            if tracks:
-                track_uris.append(tracks[0]['uri'])
-            else:
-                not_found_tracks.append(f"{track} by {artist}")
-        except Exception as e:
-            st.warning(f"Could not search for '{track} by {artist}': {e}")
+    # 3. Hard Fail
+    return {'status': 'NOT_FOUND', 'data': None}
 
-        progress_bar.progress((i + 1) / len(songs), text=f"Searching for: {track} by {artist}")
+def generate_verified_song_list(vibe, sp_client, num_songs=15):
+    """
+    Runs the collaborative loop with an advanced clarification step.
+    """
+    verified_tracks = []
+    rejected_suggestions = []
+    max_attempts = num_songs * 4 # Increased attempts for potential clarification loops
 
-    progress_bar.empty() # Clear the progress bar
-    return track_uris, not_found_tracks
-    
+    progress_bar = st.progress(0, text=f"Starting playlist generation... (0/{num_songs})")
+
+    for attempt in range(max_attempts):
+        if len(verified_tracks) >= num_songs:
+            break
+
+        progress_text = f"Found {len(verified_tracks)}/{num_songs} songs. Asking AI for the next idea..."
+        progress_bar.progress(len(verified_tracks) / num_songs, text=progress_text)
+        
+        found_songs_info = [{'artist': t['artist'], 'track': t['track']} for t in verified_tracks]
+        suggestion = get_next_song_suggestion(vibe, found_songs_info, rejected_suggestions)
+
+        if not suggestion or not suggestion.get('track'):
+            continue
+
+        suggestion_str = f"{suggestion['track']} by {suggestion['artist']}"
+        if suggestion_str in rejected_suggestions:
+            continue
+            
+        progress_bar.progress(len(verified_tracks) / num_songs, text=f"Found {len(verified_tracks)}/{num_songs}. Verifying: '{suggestion_str}'...")
+
+        verification = verify_song_on_spotify(suggestion, sp_client)
+
+        if verification['status'] == 'FOUND':
+            track_data = verification['data']
+            st.toast(f"✅ Found: {track_data['name']} by {track_data['artists'][0]['name']}")
+            verified_tracks.append({
+                'uri': track_data['uri'],
+                'track': track_data['name'],
+                'artist': track_data['artists'][0]['name']
+            })
+
+        elif verification['status'] == 'NEEDS_CLARIFICATION':
+            st.toast(f"🤔 '{suggestion_str}' wasn't an exact match. Asking AI to clarify...")
+            clarified_suggestion = get_clarification_from_llm(suggestion, verification['data'])
+            
+            if clarified_suggestion:
+                # Final check on the clarified choice
+                final_verification = verify_song_on_spotify(clarified_suggestion, sp_client)
+                if final_verification['status'] == 'FOUND':
+                    track_data = final_verification['data']
+                    st.toast(f"✅ Corrected & Found: {track_data['name']}")
+                    verified_tracks.append({
+                        'uri': track_data['uri'],
+                        'track': track_data['name'],
+                        'artist': track_data['artists'][0]['name']
+                    })
+                else: # Clarified choice also failed
+                    rejected_suggestions.append(suggestion_str)
+            else: # LLM said none were correct
+                st.toast(f"❌ AI confirmed no good match for '{suggestion_str}'.")
+                rejected_suggestions.append(suggestion_str)
+
+        elif verification['status'] == 'NOT_FOUND':
+            st.toast(f"❌ '{suggestion_str}' not found. Asking AI for another.")
+            rejected_suggestions.append(suggestion_str)
+
+    progress_bar.empty()
+    if len(verified_tracks) < num_songs:
+        st.warning(f"Could only find {len(verified_tracks)} songs after {max_attempts} attempts.")
+
+    return [track['uri'] for track in verified_tracks]
+
 def sanitize_for_spotify(input_string):
     """
     Cleans a string to make it safe for Spotify API fields like name and description.
@@ -282,9 +294,6 @@ else:
         del st.session_state['token_info']
         st.rerun()
 
-    # --- Load your local song dataset ---
-    song_dataset_df = load_song_dataset()
-
     # --- Main App Interface ---
     st.markdown("---")
     st.header("1. Describe your Vibe")
@@ -297,33 +306,20 @@ else:
     if st.button("✨ Generate Playlist ✨", type="primary", use_container_width=True):
         if not vibe_input:
             st.warning("Please describe a vibe first!")
-        elif song_dataset_df is None:
-            st.error("Cannot generate playlist because the song dataset failed to load. Check the file path and format.")
         else:
-            with st.spinner("🎧 Asking the AI DJ for recommendations... (This might take a moment)"):
-                # Pass the loaded dataframe to the generation function
-                songs = generate_song_list(vibe_input, song_dataset_df)
+            # This single function call now handles the entire intelligent loop
+            verified_uris = generate_verified_song_list(vibe_input, sp_client)
 
-            if songs:
-                st.info(f"AI recommended {len(songs)} songs. Now finding them on Spotify...")
+            if verified_uris:
+                with st.spinner("🎶 Creating your new playlist on Spotify..."):
+                    playlist_url = create_spotify_playlist(vibe_input, verified_uris, sp_client)
                 
-                track_uris, not_found = find_spotify_tracks(songs, sp_client)
-                
-                if not_found:
-                    with st.expander(f"⚠️ Couldn't find {len(not_found)} tracks on Spotify"):
-                        for track in not_found:
-                            st.write(f"- {track}")
-
-                if track_uris:
-                    with st.spinner("🎶 Creating your new playlist on Spotify..."):
-                        playlist_url = create_spotify_playlist(vibe_input, track_uris, sp_client)
-                    
-                    if playlist_url:
-                        st.balloons()
-                        st.header("🎉 Your playlist is ready!")
-                        st.markdown(f"**[Click here to open your new playlist in Spotify]({playlist_url})**", unsafe_allow_html=True)
-                else:
-                    st.error("Could not find any of the recommended songs on Spotify. Try a different vibe!")
+                if playlist_url:
+                    st.balloons()
+                    st.header("🎉 Your playlist is ready!")
+                    st.markdown(f"**[Click here to open your new playlist in Spotify]({playlist_url})**", unsafe_allow_html=True)
+            else:
+                st.error("Could not find enough songs for that vibe after multiple attempts. Please try being more specific or using a different vibe!")
 
     st.markdown("---")
     if st.button("Logout of Spotify"):

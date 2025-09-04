@@ -212,7 +212,7 @@ else:
     try:
         sp_client = spotipy.Spotify(auth=token_info['access_token'])
         user_info = sp_client.current_user()
-        st.success(f"Logged in as **{user_info['display_name']}**")
+        st.success(f"Logged in")
     except Exception as e:
         st.error(f"Error connecting to Spotify. Please try logging in again. Details: {e}")
         del st.session_state['token_info']

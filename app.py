@@ -165,7 +165,7 @@ def create_spotify_playlist(vibe, track_uris, sp_client):
 
 # --- Streamlit UI ---
 
-st.set_page_config(page_title="VibeList AI", page_icon="🎵")
+st.set_page_config(page_title="VibeList AI", page_icon="./Logo.png")
 st.title("🎵 VibeList AI")
 st.subheader("Your personal AI DJ for creating the perfect Spotify playlist from any vibe.")
 

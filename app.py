@@ -8,13 +8,12 @@ import re
 # --- Configuration ---
 # Load secrets from Streamlit's secrets management
 try:
-    # Switched from OpenAI to Google Gemini
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
     SPOTIFY_CLIENT_ID = st.secrets["SPOTIFY_CLIENT_ID"]
     SPOTIFY_CLIENT_SECRET = st.secrets["SPOTIFY_CLIENT_SECRET"]
     
     # This is the Redirect URI for your deployed app. 
-    # For local testing, you must change this to "http://localhost:8501" 
+    # For local testing, change this to "http://localhost:8501" 
     # AND update it in your Spotify Developer Dashboard.
     REDIRECT_URI = "https://vibelist-ai.streamlit.app/"
 except FileNotFoundError:
@@ -71,7 +70,8 @@ def get_next_song_suggestion(vibe, found_songs, rejected_songs):
         generation_config = genai.types.GenerationConfig(response_mime_type="application/json")
         response = model.generate_content(prompt, generation_config=generation_config)
         return json.loads(response.text)
-    except Exception:
+    except Exception as e:
+        st.warning(f"AI failed to suggest a song: {e}")
         return None
 
 def get_clarification_from_llm(original_suggestion, spotify_options):
@@ -99,7 +99,8 @@ def get_clarification_from_llm(original_suggestion, spotify_options):
         if clarified_choice.get("track") == "None":
             return None
         return clarified_choice
-    except Exception:
+    except Exception as e:
+        st.warning(f"AI failed to clarify: {e}")
         return None
 
 def verify_song_on_spotify(suggestion, sp_client):
@@ -125,21 +126,22 @@ def verify_song_on_spotify(suggestion, sp_client):
     if results_broad['tracks']['items']:
         options = [
             {'track': item['name'], 'artist': item['artists'][0]['name']} 
-            for item in results_broad['tracks']['items']
+            for item in results_broad['tracks']['items'] if item and item['artists']
         ]
-        # Return options for the LLM to clarify
-        return {'status': 'NEEDS_CLARIFICATION', 'data': options}
+        if options:
+            return {'status': 'NEEDS_CLARIFICATION', 'data': options}
         
     # 3. Hard Fail
     return {'status': 'NOT_FOUND', 'data': None}
 
+
 def generate_verified_song_list(vibe, sp_client, num_songs=15):
     """
-    Runs the collaborative loop with an advanced clarification step.
+    Runs the collaborative loop with an advanced clarification step. This is the master function.
     """
     verified_tracks = []
     rejected_suggestions = []
-    max_attempts = num_songs * 4 # Increased attempts for potential clarification loops
+    max_attempts = num_songs * 4 # Safety break to prevent infinite loops
 
     progress_bar = st.progress(0, text=f"Starting playlist generation... (0/{num_songs})")
 
@@ -153,7 +155,7 @@ def generate_verified_song_list(vibe, sp_client, num_songs=15):
         found_songs_info = [{'artist': t['artist'], 'track': t['track']} for t in verified_tracks]
         suggestion = get_next_song_suggestion(vibe, found_songs_info, rejected_suggestions)
 
-        if not suggestion or not suggestion.get('track'):
+        if not suggestion or not suggestion.get('track') or not suggestion.get('artist'):
             continue
 
         suggestion_str = f"{suggestion['track']} by {suggestion['artist']}"
@@ -162,52 +164,56 @@ def generate_verified_song_list(vibe, sp_client, num_songs=15):
             
         progress_bar.progress(len(verified_tracks) / num_songs, text=f"Found {len(verified_tracks)}/{num_songs}. Verifying: '{suggestion_str}'...")
 
-        verification = verify_song_on_spotify(suggestion, sp_client)
+        try:
+            verification = verify_song_on_spotify(suggestion, sp_client)
 
-        if verification['status'] == 'FOUND':
-            track_data = verification['data']
-            st.toast(f"✅ Found: {track_data['name']} by {track_data['artists'][0]['name']}")
-            verified_tracks.append({
-                'uri': track_data['uri'],
-                'track': track_data['name'],
-                'artist': track_data['artists'][0]['name']
-            })
+            if verification['status'] == 'FOUND':
+                track_data = verification['data']
+                st.toast(f"✅ Found: {track_data['name']} by {track_data['artists'][0]['name']}")
+                verified_tracks.append({
+                    'uri': track_data['uri'],
+                    'track': track_data['name'],
+                    'artist': track_data['artists'][0]['name']
+                })
 
-        elif verification['status'] == 'NEEDS_CLARIFICATION':
-            st.toast(f"🤔 '{suggestion_str}' wasn't an exact match. Asking AI to clarify...")
-            clarified_suggestion = get_clarification_from_llm(suggestion, verification['data'])
-            
-            if clarified_suggestion:
-                # Final check on the clarified choice
-                final_verification = verify_song_on_spotify(clarified_suggestion, sp_client)
-                if final_verification['status'] == 'FOUND':
-                    track_data = final_verification['data']
-                    st.toast(f"✅ Corrected & Found: {track_data['name']}")
-                    verified_tracks.append({
-                        'uri': track_data['uri'],
-                        'track': track_data['name'],
-                        'artist': track_data['artists'][0]['name']
-                    })
-                else: # Clarified choice also failed
+            elif verification['status'] == 'NEEDS_CLARIFICATION':
+                st.toast(f"🤔 '{suggestion_str}' wasn't an exact match. Asking AI to clarify...")
+                clarified_suggestion = get_clarification_from_llm(suggestion, verification['data'])
+                
+                if clarified_suggestion:
+                    # Final check on the clarified choice
+                    final_verification = verify_song_on_spotify(clarified_suggestion, sp_client)
+                    if final_verification['status'] == 'FOUND':
+                        track_data = final_verification['data']
+                        st.toast(f"✅ Corrected & Found: {track_data['name']}")
+                        verified_tracks.append({
+                            'uri': track_data['uri'],
+                            'track': track_data['name'],
+                            'artist': track_data['artists'][0]['name']
+                        })
+                    else: # Clarified choice also failed
+                        rejected_suggestions.append(suggestion_str)
+                else: # LLM said none were correct
+                    st.toast(f"❌ AI confirmed no good match for '{suggestion_str}'.")
                     rejected_suggestions.append(suggestion_str)
-            else: # LLM said none were correct
-                st.toast(f"❌ AI confirmed no good match for '{suggestion_str}'.")
-                rejected_suggestions.append(suggestion_str)
 
-        elif verification['status'] == 'NOT_FOUND':
-            st.toast(f"❌ '{suggestion_str}' not found. Asking AI for another.")
+            elif verification['status'] == 'NOT_FOUND':
+                st.toast(f"❌ '{suggestion_str}' not found. Asking AI for another.")
+                rejected_suggestions.append(suggestion_str)
+        
+        except Exception as e:
+            st.error(f"An unexpected error occurred: {e}")
             rejected_suggestions.append(suggestion_str)
+
 
     progress_bar.empty()
     if len(verified_tracks) < num_songs:
-        st.warning(f"Could only find {len(verified_tracks)} songs after {max_attempts} attempts.")
+        st.warning(f"Could only find {len(verified_tracks)} songs after {max_attempts} attempts. The playlist will be created with these songs.")
 
     return [track['uri'] for track in verified_tracks]
 
 def sanitize_for_spotify(input_string):
-    """
-    Cleans a string to make it safe for Spotify API fields like name and description.
-    """
+    """Cleans a string to make it safe for Spotify API fields like name and description."""
     if not input_string:
         return ""
     s = re.sub(r'\s+', ' ', input_string)
@@ -215,9 +221,7 @@ def sanitize_for_spotify(input_string):
     return s
 
 def create_spotify_playlist(vibe, track_uris, sp_client):
-    """
-    Creates a new private playlist on Spotify and adds tracks to it.
-    """
+    """Creates a new private playlist on Spotify and adds tracks to it."""
     try:
         user_id = sp_client.current_user()['id']
         sanitized_vibe = sanitize_for_spotify(vibe)
@@ -251,16 +255,14 @@ st.subheader("Your personal AI DJ for creating the perfect Spotify playlist from
 
 auth_manager = get_spotify_auth_manager()
 
-# Check if we are in the redirect phase
 query_params = st.query_params
 if "code" in query_params:
     try:
         code = query_params["code"]
         token_info = auth_manager.get_access_token(code)
         st.session_state['token_info'] = token_info
-        # Clear query params to prevent re-running this block
         st.query_params.clear()
-        st.rerun() # Rerun the script to move to the main app logic
+        st.rerun()
     except Exception as e:
         st.error(f"Error getting access token: {e}")
 
@@ -270,10 +272,8 @@ if 'token_info' not in st.session_state:
     st.info("To get started, you need to connect your Spotify account.")
     st.link_button("Login with Spotify", auth_url)
 else:
-    # User is authenticated
     token_info = st.session_state['token_info']
     
-    # Check if token is expired and refresh if needed
     if auth_manager.is_token_expired(token_info):
         try:
             st.session_state['token_info'] = auth_manager.refresh_access_token(token_info['refresh_token'])
@@ -284,7 +284,6 @@ else:
             del st.session_state['token_info']
             st.rerun()
 
-    # Create the authenticated Spotipy client
     try:
         sp_client = spotipy.Spotify(auth=token_info['access_token'])
         user_info = sp_client.current_user()
@@ -307,7 +306,8 @@ else:
         if not vibe_input:
             st.warning("Please describe a vibe first!")
         else:
-            # This single function call now handles the entire intelligent loop
+            # This single function call now handles the entire intelligent loop.
+            # It will return a list of URIs that are 100% verified to exist on Spotify.
             verified_uris = generate_verified_song_list(vibe_input, sp_client)
 
             if verified_uris:

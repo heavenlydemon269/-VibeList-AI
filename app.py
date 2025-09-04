@@ -4,7 +4,7 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 import json
 import re
-
+import time
 # --- Configuration ---
 # Load secrets from Streamlit's secrets management
 try:
@@ -204,7 +204,7 @@ def generate_verified_song_list(vibe, sp_client, num_songs=15):
         except Exception as e:
             st.error(f"An unexpected error occurred: {e}")
             rejected_suggestions.append(suggestion_str)
-
+        time.sleep(5)
 
     progress_bar.empty()
     if len(verified_tracks) < num_songs:

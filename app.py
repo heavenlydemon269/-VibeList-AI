@@ -37,7 +37,7 @@ except Exception as e:
 # --- Helper Functions ---
 
 
-def sanitize_vibe(input_string):
+def sanitized_vibe(input_string):
     """
     Cleans a string to make it safe for Spotify API fields like name and description.
     - Removes leading/trailing whitespace.

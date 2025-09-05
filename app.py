@@ -16,7 +16,7 @@ try:
     # This is the Redirect URI for your deployed app. 
     # For local testing, you must change this to "http://localhost:8501" 
     # AND update it in your Spotify Developer Dashboard.
-    REDIRECT_URI = "http://localhost:8501"
+    REDIRECT_URI = "https://vibelist-ai.streamlit.app/"
 except FileNotFoundError:
     st.error("Secrets file not found. Make sure you have a .streamlit/secrets.toml file with your API keys.")
     st.stop()
